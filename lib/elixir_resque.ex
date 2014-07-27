@@ -1,28 +1,38 @@
 defmodule ElixirResque do
+  use GenServer
   require IEx
 
   def init do
     Agent.start_link(fn -> Exredis.start end, name: :redis)
+
+    {:ok, pid} = GenServer.start_link(ElixirResque, [])
+    Agent.start_link(fn -> pid end, name: :server)
   end
 
-  def mass_process do
-    (1..5)
-      |> Enum.each fn(x) ->
-        IO.puts "Redis pull ##{x}"
-        client
-          |> Exredis.query(["LPOP", "caller"])
-          |> act
+  # GOALS:
+  # pull from redis
+  # if nothing returned, stop
+  # if something returned, queue up thing, repeat
+  def redis_pull do
+    redis
+      |> Exredis.query(["LPOP", "caller"])
+      |> process
+  end
+
+  def process(:undefined) do
+    IO.puts "nothing left in the Redis queue!"
+    GenServer.call server, :retrieve
+  end
+
+  def process(encoded_json) do
+    IO.puts "Pulling #{encoded_json} from Redis"
+    GenServer.cast server, fn ->
+      encoded_json
+        |> JSON.decode
+        |> call_to_ruby
       end
-  end
 
-  def act(:undefined) do
-    IO.puts "nothing to pull from Redis"
-  end
-
-  def act(encoded_json) do
-    encoded_json
-      |> JSON.decode
-      |> call_to_ruby
+    redis_pull
   end
 
   def call_to_ruby {:unexpected_token, results} do
@@ -34,11 +44,26 @@ defmodule ElixirResque do
     {:ok, klass} = Dict.fetch(hash_dict, "class")
 
     :timer.sleep(2000)
-
-    IO.puts System.cmd("cd ../; rails runner '#{klass}.process(#{id})'")
+    System.cmd("cd ../; rails runner '#{klass}.process(#{id})'")
   end
 
-  def client do
+  def redis do
     Agent.get(:redis, &(&1))
+  end
+
+  def server do
+    Agent.get(:server, &(&1))
+  end
+
+
+  # GenServer things
+
+  def handle_call(:retrieve, _from, list) do
+    reports = list |> Enum.map(fn(task) -> Task.await(task) end)
+    {:reply, reports, []}
+  end
+
+  def handle_cast(task, list) do
+    {:noreply, [Task.async(task) | list]}
   end
 end
